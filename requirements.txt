@@ -1,0 +1,7 @@
+docker
+gql[requests]
+requests
+boto3
+opencv-python-headless
+apscheduler
+python-dotenv
