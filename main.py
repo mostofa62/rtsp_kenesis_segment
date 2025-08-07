@@ -20,6 +20,8 @@ AWS_REGION = os.getenv("AWS_DEFAULT_REGION")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET = os.getenv("AWS_SECRET_ACCESS_KEY")
 
+REKOGNITION_ROLE_ARN = os.getenv("REKOGNITION_SERVICE_ROLE_ARN")
+KDS_OUTPUT_STREAM_NAME = os.getenv("KDS_OUTPUT_STREAM_NAME", "rekognition-output")
 
 docker_client = docker.from_env()
 def invoke_docker_kinesis_stream(camera_id, rtsp_link, stream_name):
@@ -72,38 +74,84 @@ kvs = boto3.client(
     region_name=AWS_REGION
 )
 
+rekognition = boto3.client(
+    "rekognition", 
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET, 
+    region_name=AWS_REGION)
+
+kds = boto3.client(
+    "kinesis", 
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET, 
+    region_name=AWS_REGION)
+
+
+# ---------------------- SHARED FUNCTIONS ----------------------
+
+def create_shared_data_stream():
+    try:
+        response = kds.describe_stream(StreamName=KDS_OUTPUT_STREAM_NAME)
+        print(f"⚠️ KDS stream '{KDS_OUTPUT_STREAM_NAME}' already exists")
+        return response["StreamDescription"]["StreamARN"]
+    except kds.exceptions.ResourceNotFoundException:
+        response = kds.create_stream(StreamName=KDS_OUTPUT_STREAM_NAME, ShardCount=1)
+        print(f"✅ Created KDS stream '{KDS_OUTPUT_STREAM_NAME}'")
+        waiter = kds.get_waiter("stream_exists")
+        waiter.wait(StreamName=KDS_OUTPUT_STREAM_NAME)
+        response = kds.describe_stream(StreamName=KDS_OUTPUT_STREAM_NAME)
+        return response["StreamDescription"]["StreamARN"]
+    except Exception as e:
+        print(f"❌ Error creating/describing KDS stream: {e}")
+        return None
+
+def create_stream_processor_for_camera(camera_name, kvs_stream_arn, kds_output_stream_arn):
+    processor_name = f"processor-{camera_name}"
+    try:
+        rekognition.describe_stream_processor(Name=processor_name)
+        print(f"⚠️ Stream processor '{processor_name}' already exists")
+        return
+    except rekognition.exceptions.ResourceNotFoundException:
+        pass  # continue to create
+
+    try:
+        response = rekognition.create_stream_processor(
+            Name=processor_name,
+            Input={'KinesisVideoStream': {'Arn': kvs_stream_arn}},
+            Output={'KinesisDataStream': {'Arn': kds_output_stream_arn}},
+            Settings={
+                'ConnectedHome': {
+                    'Labels': ['PERSON'],
+                    'MinConfidence': 50.0
+                }
+            },
+            RoleArn=REKOGNITION_ROLE_ARN
+        )
+        print(f"✅ Created stream processor: {processor_name}")
+    except Exception as e:
+        print(f"❌ Failed to create stream processor for {camera_name}: {e}")
+
+# ---------------------- ORIGINAL FUNCTIONS ----------------------
 
 def create_stream(name):
     try:
-        # First, check if the stream already exists
         response = kvs.describe_stream(StreamName=name)
         print(f"⚠️ Stream '{name}' already exists: {response['StreamInfo']['StreamARN']}")
-        return True  # Stream already exists
-
+        return response["StreamInfo"]["StreamARN"]
     except ClientError as e:
-        error_code = e.response['Error']['Code']
-        if error_code == "ResourceNotFoundException":
-            # Stream does not exist, so create it
-            try:
-                response = kvs.create_stream(
-                    StreamName=name,
-                    MediaType='video/h264',
-                    DataRetentionInHours=24
-                )
-                print(f"✅ Created stream '{name}': {response['StreamARN']}")
-                return True
-            except ClientError as ce:
-                print(f"❌ ClientError during create_stream: {ce.response['Error']['Code']} - {ce.response['Error']['Message']}")
-            except BotoCoreError as be:
-                print(f"❌ BotoCoreError during create_stream: {be}")
+        if e.response['Error']['Code'] == "ResourceNotFoundException":
+            response = kvs.create_stream(
+                StreamName=name,
+                MediaType='video/h264',
+                DataRetentionInHours=24
+            )
+            print(f"✅ Created stream '{name}': {response['StreamARN']}")
+            return response["StreamARN"]
         else:
-            print(f"❌ ClientError during describe_stream: {error_code} - {e.response['Error']['Message']}")
-    except BotoCoreError as e:
-        print(f"❌ BotoCoreError during describe_stream: {e}")
+            print(f"❌ ClientError during create_stream: {e}")
     except Exception as e:
-        print(f"❌ Unexpected error during describe/create: {e}")
-
-    return False
+        print(f"❌ Unexpected error in create_stream: {e}")
+    return None
 
 
 # Fetch top 5 inactive, not-running cameras
@@ -177,16 +225,22 @@ def update_camera_status(camera_id):
 
 # Scheduler Job
 def job():
-    print("Running scheduler job...")
+    print("📸 Running camera check job...")
+    kds_output_arn = create_shared_data_stream()
+    if not kds_output_arn:
+        print("❌ KDS output stream not available — skipping job")
+        return
     cameras = fetch_cameras()
     for cam in cameras:
         print('Camera details:', cam)
         if is_stream_working(cam["link"]):
             print(f"✅ Stream OK: {cam['name']}")
             stream_name = f'kvs-{cam["name"]}'
-            if create_stream(stream_name):
-                container_status = invoke_docker_kinesis_stream(cam["id"], cam["link"],stream_name)
+            kvs_arn = create_stream(stream_name)
+            if kvs_arn:
+                container_status = invoke_docker_kinesis_stream(cam["id"], cam["link"], stream_name)
                 if container_status:
+                    create_stream_processor_for_camera(cam["name"], kvs_arn, kds_output_arn)
                     update_camera_status(cam["id"])
         else:
             print(f"❌ Stream down: {cam['name']}")
