@@ -105,7 +105,7 @@ def create_shared_data_stream():
         print(f"❌ Error creating/describing KDS stream: {e}")
         return None
 
-def create_stream_processor_for_camera(camera_name, kvs_stream_arn, kds_output_stream_arn):
+def create_stream_processor_for_camera(camera_name, kvs_stream_arn, kds_output_stream_arn, collection_id):
     processor_name = f"processor-{camera_name}"
     try:
         rekognition.describe_stream_processor(Name=processor_name)
@@ -118,15 +118,23 @@ def create_stream_processor_for_camera(camera_name, kvs_stream_arn, kds_output_s
         response = rekognition.create_stream_processor(
             Name=processor_name,
             Input={'KinesisVideoStream': {'Arn': kvs_stream_arn}},
-            Output={'KinesisDataStream': {'Arn': kds_output_stream_arn}},
+            Output={
+                'KinesisDataStream': {'Arn': kds_output_stream_arn}
+            },
             Settings={
-                'ConnectedHome': {
-                    'Labels': ['PERSON'],
-                    'MinConfidence': 50.0
+                'FaceSearch': {
+                    'CollectionId': collection_id,  # your existing collection
+                    'FaceMatchThreshold': 75.0
                 }
             },
-            RoleArn=REKOGNITION_ROLE_ARN
+            RoleArn=REKOGNITION_ROLE_ARN,
+            NotificationChannel={
+                "SNSTopicArn": "arn:aws:sns:us-east-1:898709018953:SafeScopeRekognitionNotifications"
+            }
         )
+
+
+
         print(f"✅ Created stream processor: {processor_name}")
     except Exception as e:
         print(f"❌ Failed to create stream processor for {camera_name}: {e}")
@@ -165,10 +173,27 @@ def fetch_cameras():
             id
             name
             link
+            agenecy {
+                person_datastores(limit: 1, order_by: { id: asc }) {
+                    id
+                }
+            }
           }
         }
     """)
-    return client.execute(query)["cameras_rtsp"]
+    
+    cameras = client.execute(query)["cameras_rtsp"]
+
+    # Flatten person_datastores to datastore_id
+    for cam in cameras:
+        agency = cam.get("agenecy", {})
+        person_list = agency.get("person_datastores", [])
+        cam["datastore_id"] = person_list[0]["id"] if person_list else None
+        # Remove the original array if not needed
+        cam["agenecy"].pop("person_datastores", None)
+
+    return cameras
+
 
 
 def is_stream_accessible(url, timeout=5):
@@ -233,6 +258,8 @@ def job():
     cameras = fetch_cameras()
     for cam in cameras:
         print('Camera details:', cam)
+        print("Datastore ID:", cam["datastore_id"])
+
         if is_stream_working(cam["link"]):
             print(f"✅ Stream OK: {cam['name']}")
             stream_name = f'kvs-{cam["name"]}'
@@ -240,7 +267,7 @@ def job():
             if kvs_arn:
                 container_status = invoke_docker_kinesis_stream(cam["id"], cam["link"], stream_name)
                 if container_status:
-                    create_stream_processor_for_camera(cam["name"], kvs_arn, kds_output_arn)
+                    create_stream_processor_for_camera(cam["name"], kvs_arn, kds_output_arn,cam["datastore_id"])
                     update_camera_status(cam["id"])
         else:
             print(f"❌ Stream down: {cam['name']}")
