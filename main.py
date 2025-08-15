@@ -47,7 +47,7 @@ def invoke_docker_kinesis_stream(camera_id, rtsp_link, stream_name):
 
     try:
         container = docker_client.containers.run(
-            "mostofa62/rtspdockertest",
+            "mostofa62/kinesis_gst_python",
             detach=True,
             name=container_name,
             environment=env_vars,
@@ -128,9 +128,9 @@ def create_stream_processor_for_camera(camera_name, kvs_stream_arn, kds_output_s
                 }
             },
             RoleArn=REKOGNITION_ROLE_ARN,
-            NotificationChannel={
-                "SNSTopicArn": "arn:aws:sns:us-east-1:898709018953:SafeScopeRekognitionNotifications"
-            }
+            # NotificationChannel={
+            #     "SNSTopicArn": "arn:aws:sns:us-east-1:898709018953:SafeScopeRekognitionNotifications"
+            # }
         )
 
 
